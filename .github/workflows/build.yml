@@ -1,0 +1,121 @@
+name: build-operator-image
+
+# Build image gitops-operator tu source tag cua redhat-developer/gitops-operator
+# va push len GHCR: ghcr.io/passiontech-global/gitops-operator:<tag>
+#
+# Trigger:
+#   - schedule 1 lan/ngay: so tag moi nhat upstream voi VERSION; khac -> build.
+#     (releases/latest tu dong loai prerelease/draft — khong build RC)
+#   - workflow_dispatch: truyen input `tag` de build cu the (rong = latest).
+#
+# Deploy khong tu dong: GitOps repo (passiontech-fluxcd) bump pin qua
+# renovate/PR — build xong chi la image san sang tren GHCR.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag can build (vd v1.20.0). De trong = tag moi nhat"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build-operator-image
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve upstream tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+            # verify tag ton tai tren upstream truoc khi build
+            gh api "repos/redhat-developer/gitops-operator/git/ref/tags/$TAG" --jq '.object.sha' >/dev/null
+          else
+            TAG="$(gh api repos/redhat-developer/gitops-operator/releases/latest --jq .tag_name)"
+          fi
+          VERSION="$(cat VERSION 2>/dev/null || echo none)"
+          if [ -n "${INPUT_TAG:-}" ]; then
+            BUILD=true   # trigger tay luon build
+          elif [ "$TAG" = "$VERSION" ]; then
+            BUILD=false  # khong co tag moi — bo qua
+          else
+            BUILD=true
+          fi
+          echo "upstream tag: $TAG | VERSION: $VERSION | build: $BUILD" | tee "$GITHUB_STEP_SUMMARY"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream source at tag
+        uses: actions/checkout@v4
+        with:
+          repository: redhat-developer/gitops-operator
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          provenance: false   # avoid OCI index attestations — kubeconform/pullers doc de hon
+          sbom: false
+          tags: |
+            ghcr.io/passiontech-global/gitops-operator:${{ needs.resolve.outputs.tag }}
+            ghcr.io/passiontech-global/gitops-operator:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/redhat-developer/gitops-operator
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update VERSION on release repo
+        uses: actions/checkout@v4
+        with:
+          path: release
+
+      - name: Commit VERSION
+        working-directory: release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "${{ needs.resolve.outputs.tag }}" > VERSION
+          if git diff --quiet VERSION; then
+            echo "VERSION khong doi"
+            exit 0
+          fi
+          git add VERSION
+          git commit -m "build: upstream ${{ needs.resolve.outputs.tag }}"
+          git push
