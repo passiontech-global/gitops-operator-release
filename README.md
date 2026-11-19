@@ -32,3 +32,24 @@ Package visibility phải là **public** để node k0s pull anonymous (org → 
 `versions.yaml` + `clusters/_shared/gitops-operator.yaml` trong
 passiontech-fluxcd pin image này; renovate theo dõi
 `ghcr.io/passiontech-global/gitops-operator` để mở PR khi có tag mới.
+
+## Quy trình bump version (theo đúng thứ tự)
+
+1. **Check upstream** có tag mới chưa:
+   ```
+   gh api repos/redhat-developer/gitops-operator/releases/latest --jq .tag_name
+   ```
+   So với file `VERSION` của repo này — giống → không có gì để làm.
+2. **Trigger build** trong repo này (GHCR phải có tag trước khi fluxcd bump
+   pin — build chỉ publish lên GHCR, không deploy):
+   ```
+   gh workflow run build.yml -R passiontech-global/gitops-operator-release --ref main
+   # hoac tag cu the:
+   gh workflow run build.yml -R passiontech-global/gitops-operator-release -f tag=vX.Y.Z
+   gh run watch <run-id> -R passiontech-global/gitops-operator-release
+   ```
+   Run xong → workflow tự commit `VERSION` mới vào repo này.
+3. **Bump pin** trong `passiontech-fluxcd`:
+   `clusters/_shared/gitops-operator.yaml` (image pin) — renovate tự mở PR
+   khi GHCR có tag mới, merge PR = deploy lên cả 3 cluster (KS health gate
+   chặn nếu operator lỗi).
